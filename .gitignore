@@ -1,0 +1,8 @@
+.nextflow/
+.nextflow.log*
+work/
+results*
+__pycache__/
+.DS_Store
+.vscode/
+_STARtmp/
