@@ -45,6 +45,23 @@ params.relaxed_geno   = 0.99
 params.max_cpus       = 18
 params.max_memory     = '120 GB'
 
+// Liftover (GRCh37 -> GRCh38)
+params.grch38_ref     = "/datos/migccl/arriba_refs/GRCh38.primary_assembly.genome.fa"
+params.chain_file     = null           // Path to hg19ToHg38.over.chain.gz (auto-downloaded if null)
+params.picard_version = "3.2.0"        // Used only when --picard_jar is not provided
+params.picard_jar     = null           // Optional explicit path to picard.jar
+
+// Infer sample ID from VCF filename, removing common technical suffixes.
+def inferSampleIdFromVcfName(String filename) {
+    def sid = filename
+        .replaceAll(/\.vcf(\.gz|\.bgz)?$/, '')
+        .replaceAll(/\.hard-filtered$/, '')
+        .replaceAll(/\.annotated\.nh$/, '')
+        .replaceAll(/\.annotated$/, '')
+        .replaceAll(/\.nh$/, '')
+    return sid
+}
+
 // ── Helper: build reference entries ─────────────────────────────────────────
 // Returns list of [sample_id, population, vcf_path]
 def buildRefEntries() {
@@ -61,9 +78,7 @@ def buildRefEntries() {
             if (!vcfs) error "No VCFs matched for population '${pop}' with glob '${glob}'"
             vcfs.each { vcf ->
                 if (vcf.name.endsWith('.tbi') || vcf.name.endsWith('.csi')) return
-                def sid = vcf.name
-                    .replaceAll(/\.hard-filtered\.vcf\.gz$/, '')
-                    .replaceAll(/\.vcf(\.gz|\.bgz)?$/, '')
+                def sid = inferSampleIdFromVcfName(vcf.name)
                 entries << [sid, pop, vcf]
             }
         }
@@ -78,9 +93,7 @@ def buildRefEntries() {
         }
         file(params.ref_vcf_dir).each { vcf ->
             if (vcf.name.endsWith('.tbi') || vcf.name.endsWith('.csi')) return
-            def sid = vcf.name
-                .replaceAll(/\.hard-filtered\.vcf\.gz$/, '')
-                .replaceAll(/\.vcf(\.gz|\.bgz)?$/, '')
+            def sid = inferSampleIdFromVcfName(vcf.name)
             if (pop_map.containsKey(sid)) {
                 entries << [sid, pop_map[sid], vcf]
             }
@@ -105,9 +118,7 @@ def buildRefEntries() {
         }
         file(params.ref_vcf_dir).each { vcf ->
             if (vcf.name.endsWith('.tbi') || vcf.name.endsWith('.csi')) return
-            def sid = vcf.name
-                .replaceAll(/\.hard-filtered\.vcf\.gz$/, '')
-                .replaceAll(/\.vcf(\.gz|\.bgz)?$/, '')
+            def sid = inferSampleIdFromVcfName(vcf.name)
             if (pop_map.containsKey(sid)) {
                 entries << [sid, pop_map[sid], vcf]
             }
@@ -160,20 +171,50 @@ workflow {
     Channel.from(ref_entries.collect { it[2] }.unique())
         .set { ref_vcfs }
 
-    // 3. Index all VCFs
-    study_vcfs
-        .mix(ref_vcfs)
+    // 2b. Prepare chain file for liftover (download if not provided)
+    def chain_ch
+    if (params.chain_file) {
+        chain_ch = Channel.value(file(params.chain_file))
+    } else {
+        chain_ch = DOWNLOAD_CHAIN_FILE().chain
+    }
+
+    // 2c. Prepare Picard jar for liftover (download if not provided)
+    def picard_jar_ch
+    if (params.picard_jar) {
+        picard_jar_ch = Channel.value(file(params.picard_jar))
+    } else {
+        picard_jar_ch = DOWNLOAD_PICARD_JAR().picard
+    }
+
+    def grch38_ref_ch  = Channel.value(file(params.grch38_ref))
+    def grch38_fai_ch  = Channel.value(file("${params.grch38_ref}.fai"))
+    def grch38_dict_path = params.grch38_ref.replaceAll(/\.fa(sta)?$/, '.dict')
+    def grch38_dict_ch = Channel.value(file(grch38_dict_path))
+
+    // 3. Detect genome build and liftover GRCh37 VCFs
+    //    Study VCFs are assumed GRCh38; only ref VCFs are checked.
+    ref_vcfs
         .map { vcf ->
-            def id = vcf.name
-                .replaceAll(/\.hard-filtered\.vcf\.gz$/, '')
-                .replaceAll(/\.vcf(\.gz|\.bgz)?$/, '')
+            def id = inferSampleIdFromVcfName(vcf.name)
             tuple(id, vcf)
         }
+        .set { ref_vcfs_tuples }
+
+    DETECT_AND_LIFTOVER(ref_vcfs_tuples, chain_ch, grch38_ref_ch, grch38_fai_ch, grch38_dict_ch, picard_jar_ch)
+
+    // 4. Index all VCFs (study + harmonised refs)
+    study_vcfs
+        .map { vcf ->
+            def id = inferSampleIdFromVcfName(vcf.name)
+            tuple(id, vcf)
+        }
+        .mix(DETECT_AND_LIFTOVER.out.vcf)
         .set { all_vcfs }
 
     INDEX_VCF(all_vcfs)
 
-    // 3b. Collect study sample sites (for intersection with ref)
+    // 4b. Collect study sample sites (for intersection with ref)
     Channel.fromPath(params.input, checkIfExists: true)
         .map { it.toString() }
         .collectFile(name: 'study_vcfs.list', newLine: true)
@@ -181,7 +222,7 @@ workflow {
 
     COLLECT_STUDY_SITES(study_vcf_list_for_sites)
 
-    // 4. Merge all VCFs (restricted to study sites = intersection)
+    // 5. Merge all VCFs (restricted to study sites = intersection)
     INDEX_VCF.out
         .flatMap { id, vcf, tbi -> [vcf, tbi] }
         .collect()
@@ -189,27 +230,242 @@ workflow {
 
     MERGE_ALL(all_indexed_files, COLLECT_STUDY_SITES.out)
 
-    // 5. PLINK QC
+    // 6. PLINK QC
     PREPARE_PLINK(MERGE_ALL.out, pop_map_ch, Channel.value(actual_k))
 
-    // 6. Create .pop file for supervised ADMIXTURE
+    // 7. Create .pop file for supervised ADMIXTURE
     CREATE_POP_FILE(PREPARE_PLINK.out.fam, pop_map_ch)
 
-    // 7. Run supervised ADMIXTURE
+    // 8. Run supervised ADMIXTURE
     RUN_ADMIXTURE_SUPERVISED(
         PREPARE_PLINK.out.pruned,
         CREATE_POP_FILE.out,
         Channel.value(actual_k)
     )
 
-    // 8. Summarize Q
+    // 9. Summarize Q
     SUMMARIZE_Q(RUN_ADMIXTURE_SUPERVISED.out, pop_map_ch)
 
-    // 9. Plot
+    // 10. Plot
     PLOT_ANCESTRY(SUMMARIZE_Q.out, pop_map_ch)
+
+    // 11. PCA (all samples + references)
+    RUN_PCA(PREPARE_PLINK.out.pruned)
+    PLOT_PCA(RUN_PCA.out, pop_map_ch)
 }
 
 // ── Processes ────────────────────────────────────────────────────────────────
+
+process DOWNLOAD_CHAIN_FILE {
+    storeDir "/datos/migccl/arriba_refs"
+
+    output:
+    path "hg19ToHg38.over.chain.gz", emit: chain
+
+    script:
+    """
+    set -euo pipefail
+    echo "Downloading hg19-to-hg38 liftover chain file from UCSC..." >&2
+    wget -q -O hg19ToHg38.over.chain.gz \
+        'https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz'
+    echo "Chain file downloaded successfully." >&2
+    """
+}
+
+process DOWNLOAD_PICARD_JAR {
+    storeDir "/datos/migccl/arriba_refs"
+
+    output:
+    path "picard-${params.picard_version}.jar", emit: picard
+
+    script:
+    """
+    set -euo pipefail
+    out="picard-${params.picard_version}.jar"
+    url="https://github.com/broadinstitute/picard/releases/download/${params.picard_version}/picard.jar"
+
+    echo "Downloading Picard ${params.picard_version} from GitHub releases..." >&2
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "\$url" -o "\$out"
+    else
+        wget -q -O "\$out" "\$url"
+    fi
+
+    # Quick sanity check: ensure the jar is executable and exposes LiftoverVcf.
+    java -jar "\$out" LiftoverVcf --help >/dev/null 2>&1
+    echo "Picard downloaded successfully: \$out" >&2
+    """
+}
+
+/*
+ * DETECT_AND_LIFTOVER
+ *
+ * For each reference VCF, detects the genome build by inspecting contig
+ * lengths.  GRCh37 VCFs (chr1 ≈ 249 250 621 bp) are lifted over to GRCh38
+ * using Picard LiftoverVcf.  GRCh38 VCFs pass through unchanged.
+ *
+ * Additionally, all-sites VCFs (ALT=".") are filtered to variant-only so
+ * they don't inject false homozygous-reference genotypes into the merge.
+ */
+process DETECT_AND_LIFTOVER {
+    tag { sample_id }
+    publishDir "${params.outdir}/liftover", mode: 'copy', pattern: '*.liftover_report.txt'
+
+    input:
+    tuple val(sample_id), path(vcf)
+    path chain
+    path grch38_ref
+    path grch38_fai
+    path grch38_dict
+    path picard_jar
+
+    output:
+    tuple val(sample_id), path("${sample_id}.harmonised.vcf.gz"), emit: vcf
+    path "${sample_id}.liftover_report.txt",                      emit: report
+
+    script:
+    """
+    set -euo pipefail
+
+    REPORT="${sample_id}.liftover_report.txt"
+    echo "=== Build detection report for ${sample_id} ===" > "\$REPORT"
+    echo "Input VCF: ${vcf}" >> "\$REPORT"
+
+    # ── 1. Detect genome build by chr1 contig length ──────────────────────
+    # GRCh37/hg19 chr1 = 249250621 bp;  GRCh38/hg38 chr1 = 248956422 bp
+    chr1_len=\$(bcftools view -h ${vcf} \
+        | (grep -E '^##contig=<ID=(chr)?1,' || true) \
+        | sed -E 's/.*length=([0-9]+).*/\\1/' \
+        | head -1)
+
+    if [ -z "\$chr1_len" ]; then
+        echo "WARNING: No contig header found; assuming GRCh38 (pass-through)." >> "\$REPORT"
+        chr1_len=248956422
+    fi
+
+    echo "Detected chr1 length: \$chr1_len" >> "\$REPORT"
+
+    IS_GRCH37=0
+    if [ "\$chr1_len" -eq 249250621 ]; then
+        IS_GRCH37=1
+        echo "" >> "\$REPORT"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >> "\$REPORT"
+        echo "  BUILD: GRCh37 (hs37d5/hg19) detected" >> "\$REPORT"
+        echo "  ACTION: Liftover to GRCh38 will be performed" >> "\$REPORT"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >> "\$REPORT"
+        echo "" >> "\$REPORT"
+    else
+        echo "BUILD: GRCh38 detected  >>>  no liftover needed" >> "\$REPORT"
+    fi
+
+    # ── 2. Filter all-sites records (ALT=".") if present ──────────────────
+    bcftools view -H ${vcf} | head -10000 > _sample_10k.tmp || true
+    n_total=\$(wc -l < _sample_10k.tmp)
+    n_refonly=\$(awk '\$5 == "."' _sample_10k.tmp | wc -l)
+    rm -f _sample_10k.tmp
+    allsites_pct=\$(( n_refonly * 100 / (n_total > 0 ? n_total : 1) ))
+
+    if [ "\$allsites_pct" -gt 50 ]; then
+        echo "ALL-SITES VCF detected (\${allsites_pct}% ref-only in first 10k records). Filtering to variant-only." >> "\$REPORT"
+        FILTER_ALLSITES=1
+    else
+        FILTER_ALLSITES=0
+    fi
+
+    # ── 3. Prepare input VCF (filter all-sites if needed) ─────────────────
+    if [ "\$FILTER_ALLSITES" -eq 1 ]; then
+        bcftools view -i 'ALT!="."' ${vcf} -Oz -o filtered.vcf.gz
+        bcftools index -t filtered.vcf.gz
+        INPUT_VCF=filtered.vcf.gz
+    else
+        INPUT_VCF=${vcf}
+        if [ ! -f "\${INPUT_VCF}.tbi" ]; then
+            bcftools index -t "\$INPUT_VCF"
+        fi
+    fi
+
+    n_variants=\$(bcftools view -H "\$INPUT_VCF" | wc -l)
+    echo "Variants after all-sites filtering: \$n_variants" >> "\$REPORT"
+
+    # ── 4. Liftover if GRCh37 ────────────────────────────────────────────
+    if [ "\$IS_GRCH37" -eq 1 ]; then
+
+        echo ">>> PERFORMING LIFTOVER GRCh37 -> GRCh38 <<<" >> "\$REPORT"
+        echo "    Chain file : ${chain}" >> "\$REPORT"
+        echo "    Target ref : ${grch38_ref}" >> "\$REPORT"
+
+        # The UCSC chain uses chr-prefixed names (chr1, chr2, ...).
+        # If the input VCF uses bare names (1, 2, ...), add chr prefix first.
+        first_chr=\$(bcftools query -f '%CHROM\\n' "\$INPUT_VCF" | head -1 || true)
+        if [[ ! "\$first_chr" == chr* ]]; then
+            echo "    Renaming contigs: adding 'chr' prefix to match chain file" >> "\$REPORT"
+            cat > add_chr_map.tsv <<'CHRMAP'
+1	chr1
+2	chr2
+3	chr3
+4	chr4
+5	chr5
+6	chr6
+7	chr7
+8	chr8
+9	chr9
+10	chr10
+11	chr11
+12	chr12
+13	chr13
+14	chr14
+15	chr15
+16	chr16
+17	chr17
+18	chr18
+19	chr19
+20	chr20
+21	chr21
+22	chr22
+X	chrX
+Y	chrY
+MT	chrM
+M	chrM
+CHRMAP
+            bcftools annotate --rename-chrs add_chr_map.tsv "\$INPUT_VCF" -Oz -o renamed.vcf.gz
+            bcftools index -t renamed.vcf.gz
+            INPUT_VCF=renamed.vcf.gz
+        fi
+
+        # Run Picard LiftoverVcf
+        # Use a recent Picard jar to avoid htsjdk genotype-validation crashes seen in older releases.
+        java -Xmx${task.memory.toGiga()}g -jar ${picard_jar} LiftoverVcf \
+            I="\$INPUT_VCF" \
+            O=lifted.vcf.gz \
+            CHAIN=${chain} \
+            REJECT=rejected.vcf.gz \
+            R=${grch38_ref} \
+            WRITE_ORIGINAL_POSITION=true \
+            WARN_ON_MISSING_CONTIG=true \
+            VALIDATION_STRINGENCY=LENIENT
+
+        n_lifted=\$(bcftools view -H lifted.vcf.gz | wc -l)
+        n_rejected=\$(bcftools view -H rejected.vcf.gz 2>/dev/null | wc -l || echo 0)
+        pct_lifted=\$(( n_lifted * 100 / (n_lifted + n_rejected > 0 ? n_lifted + n_rejected : 1) ))
+        echo "    Lifted variants   : \$n_lifted" >> "\$REPORT"
+        echo "    Rejected variants : \$n_rejected" >> "\$REPORT"
+        echo "    Liftover rate     : \${pct_lifted}%" >> "\$REPORT"
+
+        # Sort the lifted VCF (liftover can scramble order)
+        bcftools sort lifted.vcf.gz -Oz -o "${sample_id}.harmonised.vcf.gz"
+        bcftools index -t "${sample_id}.harmonised.vcf.gz"
+
+    else
+        # ── GRCh38: pass through (just copy/link) ────────────────────────
+        cp "\$INPUT_VCF" "${sample_id}.harmonised.vcf.gz"
+        bcftools index -t "${sample_id}.harmonised.vcf.gz"
+    fi
+
+    echo "" >> "\$REPORT"
+    echo "Output: ${sample_id}.harmonised.vcf.gz" >> "\$REPORT"
+    cat "\$REPORT" >&2
+    """
+}
 
 process INDEX_VCF {
     tag { sample_id }
@@ -762,6 +1018,116 @@ else:
     plt.ylabel("Proportion")
     plt.tight_layout()
     plt.savefig("ancestry_plot.png", dpi=300)
+PY
+    """
+}
+
+process RUN_PCA {
+    publishDir "${params.outdir}/pca", mode: 'copy'
+
+    input:
+    tuple path(bed), path(bim), path(fam)
+
+    output:
+    tuple path("${bed.baseName}.eigenvec"), path("${bed.baseName}.eigenval")
+
+    script:
+    """
+    set -euo pipefail
+    mem_mb=${task.memory.toMega()}
+    plink_bin=\${PLINK:-${params.plink}}
+
+    # PCA from LD-pruned data generated upstream.
+    \$plink_bin --threads ${task.cpus} --memory \$mem_mb \\
+        --bfile ${bed.baseName} --pca header --out ${bed.baseName}
+    """
+}
+
+process PLOT_PCA {
+    publishDir "${params.outdir}/plots", mode: 'copy'
+    conda 'environment.yml'
+
+    input:
+    tuple path(eigenvec), path(eigenval)
+    path pop_map
+
+    output:
+    path "pca_all_samples.png"
+    path "pca_all_samples.tsv"
+
+    script:
+    """
+    python3 - <<'PY'
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+eigenvec_f = "${eigenvec}"
+eigenval_f = "${eigenval}"
+pop_map_f  = "${pop_map}"
+
+# Read reference pop map (sample_id -> population)
+pop_map = {}
+with open(pop_map_f, "r") as f:
+    for line in f:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            parts = line.split("\\t")
+            if len(parts) >= 2:
+                pop_map[parts[0]] = parts[1]
+
+# Read eigenvectors
+df = pd.read_csv(eigenvec_f, sep="\\s+")
+df.columns = [c.lstrip("#") for c in df.columns]
+
+if "IID" not in df.columns:
+    if len(df.columns) >= 2:
+        df = df.rename(columns={df.columns[1]: "IID"})
+    else:
+        raise SystemExit("Malformed eigenvec: missing IID column")
+
+pc_cols = [c for c in df.columns if c.upper().startswith("PC")]
+if len(pc_cols) < 2:
+    raise SystemExit("PCA output has fewer than 2 components")
+
+for c in pc_cols:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df["Population"] = df["IID"].map(pop_map).fillna("study")
+df[["IID", "Population"] + pc_cols].to_csv("pca_all_samples.tsv", sep="\\t", index=False)
+
+# Eigenvalue-based explained variance for axis labels (if available)
+pc1, pc2 = pc_cols[0], pc_cols[1]
+try:
+    eig = pd.read_csv(eigenval_f, header=None).iloc[:, 0].astype(float).tolist()
+    if len(eig) >= 2 and sum(eig) > 0:
+        pc1 = f"{pc1} ({100.0 * eig[0] / sum(eig):.2f}%)"
+        pc2 = f"{pc2} ({100.0 * eig[1] / sum(eig):.2f}%)"
+except Exception:
+    pass
+
+fig, ax = plt.subplots(figsize=(11, 8))
+
+ref_pops = sorted([p for p in df["Population"].unique() if p != "study"])
+palette = plt.cm.tab10.colors
+for i, pop in enumerate(ref_pops):
+    sub = df[df["Population"] == pop]
+    ax.scatter(sub[pc_cols[0]], sub[pc_cols[1]], s=28, alpha=0.8,
+               color=palette[i % len(palette)], label=pop)
+
+study = df[df["Population"] == "study"]
+if not study.empty:
+    ax.scatter(study[pc_cols[0]], study[pc_cols[1]], s=24, alpha=0.85,
+               c="black", marker="x", label="study")
+
+ax.set_title("PCA: Study Samples + Reference Populations")
+ax.set_xlabel(pc1)
+ax.set_ylabel(pc2)
+ax.grid(True, alpha=0.25)
+ax.legend(loc="best", frameon=True)
+plt.tight_layout()
+plt.savefig("pca_all_samples.png", dpi=300)
 PY
     """
 }
