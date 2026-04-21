@@ -31,6 +31,9 @@ params.ref_pop_map    = null
 params.ref_manifests  = null           // "Pop1:manifest.tsv;Pop2:manifest.tsv"
 
 // QC / PLINK
+params.extract_snps   = null           // File containing list of SNPs to keep (e.g., AIMs)
+params.exclude_snps   = null           // File containing list of SNPs to exclude
+params.exclude_regions = null          // BED file containing regions to exclude (e.g., leukemia genes)
 params.maf            = 0.05
 params.geno           = 0.05
 params.mind           = 0.8
@@ -252,6 +255,9 @@ workflow {
     // 11. PCA (all samples + references)
     RUN_PCA(PREPARE_PLINK.out.pruned)
     PLOT_PCA(RUN_PCA.out, pop_map_ch)
+
+    // 12. Plot P matrix and annotate top SNPs
+    PLOT_P_MATRIX(RUN_ADMIXTURE_SUPERVISED.out, PREPARE_PLINK.out.pruned)
 }
 
 // ── Processes ────────────────────────────────────────────────────────────────
@@ -726,17 +732,68 @@ process PREPARE_PLINK {
     plink=\${PLINK2:-${params.plink2}}
     mem_mb=${task.memory.toMega()}
 
+    extract_cmd=""
+    ${params.extract_snps ? """
+    extract_file="${params.extract_snps}"
+    if [[ "\$extract_file" != /* ]]; then
+        extract_file="${workflow.launchDir}/\$extract_file"
+    fi
+    if [[ "\$extract_file" == *.csv ]]; then
+        awk -F',' 'NR>1 {
+            if (\$1 != "" && \$1 != ".") print \$1;
+            if (\$2 != "" && \$3 != "") {
+                print \$2":"\$3;
+                print "chr"\$2":"\$3;
+            }
+        }' "\$extract_file" > extract_list.txt
+    else
+        cp "\$extract_file" extract_list.txt
+    fi
+    extract_cmd="--extract extract_list.txt"
+    """ : ""}
+
+    exclude_cmd=""
+    ${params.exclude_snps ? """
+    exclude_file="${params.exclude_snps}"
+    if [[ "\$exclude_file" != /* ]]; then
+        exclude_file="${workflow.launchDir}/\$exclude_file"
+    fi
+    if [[ "\$exclude_file" == *.csv ]]; then
+        awk -F',' 'NR>1 {print \$1}' "\$exclude_file" > exclude_list.txt
+    else
+        cp "\$exclude_file" exclude_list.txt
+    fi
+    exclude_cmd="--exclude exclude_list.txt"
+    """ : ""}
+
+    ${params.exclude_regions ? """
+    exclude_regions_file="${params.exclude_regions}"
+    if [[ "\$exclude_regions_file" != /* ]]; then
+        exclude_regions_file="${workflow.launchDir}/\$exclude_regions_file"
+    fi
+    cp "\$exclude_regions_file" exclude_regions.bed
+    exclude_cmd="\$exclude_cmd --exclude bed0 exclude_regions.bed"
+    """ : ""}
+
     # VCF -> PLINK2 pgen (autosomes only, sort variants)
     \$plink --threads ${task.cpus} --memory \$mem_mb \\
         --vcf ${vcf} --max-alleles 2 --autosome --make-pgen --sort-vars --out sorted
 
     # pgen -> BED
     \$plink --threads ${task.cpus} --memory \$mem_mb \\
-        --pfile sorted --make-bed --out base
+        --pfile sorted --set-missing-var-ids @:# \$extract_cmd \$exclude_cmd --make-bed --out base
 
     # Keep biallelic SNPs only
     \$plink --threads ${task.cpus} --memory \$mem_mb \\
         --bfile base --snps-only just-acgt --max-alleles 2 --make-bed --out snps
+
+    # Filter out ambiguous A/T and C/G SNPs
+    awk '(\$5=="A" && \$6=="T") || (\$5=="T" && \$6=="A") || (\$5=="C" && \$6=="G") || (\$5=="G" && \$6=="C") {print \$2}' snps.bim > ambiguous_snps.txt
+    \$plink --threads ${task.cpus} --memory \$mem_mb \\
+        --bfile snps --exclude ambiguous_snps.txt --make-bed --out snps_filtered
+    mv snps_filtered.bed snps.bed
+    mv snps_filtered.bim snps.bim
+    mv snps_filtered.fam snps.fam
 
     # QC (strict first): MAF, missingness, mind
     strict_ok=1
@@ -1129,5 +1186,49 @@ ax.legend(loc="best", frameon=True)
 plt.tight_layout()
 plt.savefig("pca_all_samples.png", dpi=300)
 PY
+    """
+}
+
+process PLOT_P_MATRIX {
+    publishDir "${params.outdir}/plots", mode: 'copy'
+    conda 'environment.yml'
+
+    input:
+    tuple path(q_matrix), path(p_matrix), path(fam_file), path(pop_file)
+    tuple path(bed), path(bim), path("plink_fam")
+
+    output:
+    path "p_matrix_informative.png"
+    path "p_matrix_top_markers.tsv"
+    path "p_matrix_top50_gene_function.tsv"
+
+    script:
+    """
+    # Copy the scripts to the working directory
+    cp /datos/home/epaaso/ancestry/admix_whole/results/plots/make_p_matrix_plot.py .
+    cp /datos/home/epaaso/ancestry/admix_whole/results/plots/annotate_top50_snps.py .
+    
+    # Ensure they are executable
+    chmod +x make_p_matrix_plot.py annotate_top50_snps.py
+    
+    # We need to modify the script to use the local files instead of hardcoded paths
+    sed -i 's|base = Path("/datos/home/epaaso/ancestry/admix_whole/results")|base = Path(".")|g' make_p_matrix_plot.py
+    sed -i 's|admix_dir = base / "admixture"|admix_dir = base|g' make_p_matrix_plot.py
+    sed -i 's|plink_dir = base / "plink"|plink_dir = base|g' make_p_matrix_plot.py
+    sed -i 's|out_dir = base / "plots"|out_dir = base|g' make_p_matrix_plot.py
+    sed -i 's|p_path = admix_dir / "merged_pruned.3.P"|p_path = Path("${p_matrix}")|g' make_p_matrix_plot.py
+    sed -i 's|q_path = admix_dir / "merged_pruned.3.Q"|q_path = Path("${q_matrix}")|g' make_p_matrix_plot.py
+    sed -i 's|pop_path = admix_dir / "merged_pruned.pop"|pop_path = Path("${pop_file}")|g' make_p_matrix_plot.py
+    sed -i 's|fam_path = admix_dir / "merged_pruned.fam"|fam_path = Path("${fam_file}")|g' make_p_matrix_plot.py
+    sed -i 's|bim_path = plink_dir / "merged_pruned.bim"|bim_path = Path("${bim}")|g' make_p_matrix_plot.py
+    
+    sed -i 's|BASE = Path("/datos/home/epaaso/ancestry/admix_whole/results/plots")|BASE = Path(".")|g' annotate_top50_snps.py
+    
+    # Run the scripts
+    ./make_p_matrix_plot.py
+    ./annotate_top50_snps.py
+    
+    # Run the plot script again to use the annotations
+    ./make_p_matrix_plot.py
     """
 }
