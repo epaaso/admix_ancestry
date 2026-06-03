@@ -226,15 +226,34 @@ workflow {
     COLLECT_STUDY_SITES(study_vcf_list_for_sites)
 
     // 5. Merge all VCFs (restricted to study sites = intersection)
-    INDEX_VCF.out
+    HARMONIZE_CONTIGS(INDEX_VCF.out, COLLECT_STUDY_SITES.out)
+
+    HARMONIZE_CONTIGS.out.harmonized
         .flatMap { id, vcf, tbi -> [vcf, tbi] }
         .collect()
-        .set { all_indexed_files }
+        .set { all_harmonized_files }
 
-    MERGE_ALL(all_indexed_files, COLLECT_STUDY_SITES.out)
+    SPLIT_STUDY_SITES(COLLECT_STUDY_SITES.out)
+
+    SPLIT_STUDY_SITES.out.sites_files
+        .flatten()
+        .map { file ->
+            def chr = file.name.replaceAll(/^sites_/, "").replaceAll(/\.tsv$/, "")
+            tuple(chr, file)
+        }
+        .set { split_sites_ch }
+
+    MERGE_CHROMOSOME(split_sites_ch, all_harmonized_files)
+
+    MERGE_CHROMOSOME.out.merged_chr
+        .flatMap { chr, vcf, tbi -> [vcf, tbi] }
+        .collect()
+        .set { all_merged_chrs }
+
+    CONCAT_VCFS(all_merged_chrs, SPLIT_STUDY_SITES.out.chr_list, COLLECT_STUDY_SITES.out)
 
     // 6. PLINK QC
-    PREPARE_PLINK(MERGE_ALL.out, pop_map_ch, Channel.value(actual_k))
+    PREPARE_PLINK(CONCAT_VCFS.out, pop_map_ch, Channel.value(actual_k))
 
     // 7. Create .pop file for supervised ADMIXTURE
     CREATE_POP_FILE(PREPARE_PLINK.out.fam, pop_map_ch)
@@ -515,83 +534,20 @@ process COLLECT_STUDY_SITES {
     """
 }
 
-process MERGE_ALL {
-    publishDir "${params.outdir}/merged", mode: 'copy'
+process HARMONIZE_CONTIGS {
+    tag { sample_id }
 
     input:
-    path all_files
+    tuple val(sample_id), path(vcf), path(tbi)
     path study_sites
 
     output:
-    tuple path("merged.vcf.gz"), path("merged.vcf.gz.tbi")
+    tuple val(sample_id), path("${sample_id}.harmonized.vcf.gz"), path("${sample_id}.harmonized.vcf.gz.tbi"), emit: harmonized
 
     script:
     """
     set -euo pipefail
 
-    # List only VCF files for merge
-    # Ignore possible leftovers from prior failed attempts in the same work dir.
-    (ls *.vcf.gz | grep -Ev '^merged(_raw)?\\.vcf\\.gz\$' || true) | sort -V > all_files.txt
-    n_all=\$(wc -l < all_files.txt)
-    echo "Found \$n_all VCF files for merge" >&2
-
-    # Drop fully redundant files with duplicated sample IDs.
-    # If a file has a partial overlap (some duplicated + some new samples), fail fast.
-    : > file_list.txt
-    declare -A seen_samples=()
-    n_kept=0
-    n_skipped=0
-
-    while IFS= read -r vcf; do
-        [ -n "\$vcf" ] || continue
-
-        mapfile -t samples < <(bcftools query -l "\$vcf")
-        if [ "\${#samples[@]}" -eq 0 ]; then
-            echo "ERROR: No samples found in \$vcf" >&2
-            exit 1
-        fi
-
-        dup_samples=()
-        new_count=0
-        for s in "\${samples[@]}"; do
-            if [[ -v "seen_samples[\$s]" ]]; then
-                dup_samples+=("\$s")
-            else
-                new_count=\$((new_count + 1))
-            fi
-        done
-
-        if [ "\${#dup_samples[@]}" -gt 0 ] && [ "\$new_count" -gt 0 ]; then
-            echo "ERROR: Input VCF '\$vcf' mixes duplicate and new samples." >&2
-            echo "Duplicate samples: \${dup_samples[*]}" >&2
-            echo "Please remove overlapping multi-sample VCFs from the merge input." >&2
-            exit 1
-        fi
-
-        if [ "\$new_count" -eq 0 ]; then
-            n_skipped=\$((n_skipped + 1))
-            echo "Skipping redundant VCF \$vcf (all samples already present)" >&2
-            continue
-        fi
-
-        printf '%s\n' "\$vcf" >> file_list.txt
-        n_kept=\$((n_kept + 1))
-        for s in "\${samples[@]}"; do
-            seen_samples["\$s"]=1
-        done
-    done < all_files.txt
-
-    n_files=\$(wc -l < file_list.txt)
-    echo "Merging \$n_files VCF files (skipped \$n_skipped redundant files)..." >&2
-
-    if [ "\$n_files" -eq 0 ]; then
-        echo "ERROR: No non-redundant VCF files available after sample deduplication." >&2
-        exit 1
-    fi
-
-    # Harmonize chromosome naming across cohorts (e.g., "1" vs "chr1").
-    # Use study sites naming style as the target convention.
-    : > merge_list.txt
     first_site_chr=\$(awk 'NR==1 {print \$1}' ${study_sites})
     if [ -z "\$first_site_chr" ]; then
         echo "ERROR: Study site list is empty." >&2
@@ -660,55 +616,170 @@ chrMT	MT
 EOF
     fi
 
-    n_renamed=0
+    first_chr=\$(bcftools query -f '%CHROM\\n' "${vcf}" | head -n 1 || true)
+    needs_rename=0
+    if [ "\$target_style" = "chr" ] && [[ ! "\$first_chr" == chr* ]]; then
+        needs_rename=1
+    fi
+    if [ "\$target_style" = "nochr" ] && [[ "\$first_chr" == chr* ]]; then
+        needs_rename=1
+    fi
+
+    if [ "\$needs_rename" -eq 1 ]; then
+        bcftools annotate --threads ${task.cpus} --rename-chrs chr_map.tsv -Oz -o "${sample_id}.harmonized.vcf.gz" "${vcf}"
+        bcftools index -t "${sample_id}.harmonized.vcf.gz"
+    else
+        cp "${vcf}" "${sample_id}.harmonized.vcf.gz"
+        cp "${tbi}" "${sample_id}.harmonized.vcf.gz.tbi"
+    fi
+    """
+}
+
+process SPLIT_STUDY_SITES {
+    input:
+    path study_sites
+
+    output:
+    path "sites_*.tsv", emit: sites_files
+    path "chr_list.txt", emit: chr_list
+
+    script:
+    """
+    python3 - <<'PY'
+import sys
+from collections import defaultdict
+
+study_sites = "${study_sites}"
+sites_by_chr = defaultdict(list)
+
+# Read study sites
+with open(study_sites, 'r') as f:
+    for line in f:
+        idx = line.find('\t')
+        if idx != -1:
+            chrom = line[:idx]
+            sites_by_chr[chrom].append(line)
+
+# Write to per-chromosome site files and print chromosomes in order
+with open("chr_list.txt", "w") as chr_list_f:
+    for chrom, lines in sites_by_chr.items():
+        with open(f"sites_{chrom}.tsv", "w") as out_f:
+            out_f.writelines(lines)
+        chr_list_f.write(chrom + "\\n")
+PY
+    """
+}
+
+process MERGE_CHROMOSOME {
+    tag { chr }
+
+    input:
+    tuple val(chr), path(chr_sites)
+    path all_harmonized_files
+
+    output:
+    tuple val(chr), path("merged_${chr}.vcf.gz"), path("merged_${chr}.vcf.gz.tbi"), emit: merged_chr
+
+    script:
+    """
+    set -euo pipefail
+
+    ls *.harmonized.vcf.gz | sort -V > all_files.txt
+
+    : > file_list.txt
+    declare -A seen_samples=()
+    n_kept=0
+    n_skipped=0
+
     while IFS= read -r vcf; do
         [ -n "\$vcf" ] || continue
-        first_chr=\$(bcftools query -f '%CHROM\n' "\$vcf" | head -n 1 || true)
-        if [ -z "\$first_chr" ]; then
-            printf '%s\n' "\$vcf" >> merge_list.txt
+
+        # Query samples in VCF
+        mapfile -t samples < <(bcftools query -l "\$vcf")
+        if [ "\${#samples[@]}" -eq 0 ]; then
+            echo "ERROR: No samples found in \$vcf" >&2
+            exit 1
+        fi
+
+        dup_samples=()
+        new_count=0
+        for s in "\${samples[@]}"; do
+            if [[ -v "seen_samples[\$s]" ]]; then
+                dup_samples+=("\$s")
+            else
+                new_count=\$((new_count + 1))
+            fi
+        done
+
+        if [ "\${#dup_samples[@]}" -gt 0 ] && [ "\$new_count" -gt 0 ]; then
+            echo "ERROR: Input VCF '\$vcf' mixes duplicate and new samples." >&2
+            echo "Duplicate samples: \${dup_samples[*]}" >&2
+            echo "Please remove overlapping multi-sample VCFs from the merge input." >&2
+            exit 1
+        fi
+
+        if [ "\$new_count" -eq 0 ]; then
+            n_skipped=\$((n_skipped + 1))
             continue
         fi
 
-        needs_rename=0
-        if [ "\$target_style" = "chr" ] && [[ ! "\$first_chr" == chr* ]]; then
-            needs_rename=1
-        fi
-        if [ "\$target_style" = "nochr" ] && [[ "\$first_chr" == chr* ]]; then
-            needs_rename=1
-        fi
+        printf '%s\\n' "\$vcf" >> file_list.txt
+        n_kept=\$((n_kept + 1))
+        for s in "\${samples[@]}"; do
+            seen_samples["\$s"]=1
+        done
+    done < all_files.txt
 
-        if [ "\$needs_rename" -eq 1 ]; then
-            harmonized_vcf="\${vcf%.vcf.gz}.harmonized.vcf.gz"
-            bcftools annotate --threads ${task.cpus} --rename-chrs chr_map.tsv -Oz -o "\$harmonized_vcf" "\$vcf"
-            bcftools index -t "\$harmonized_vcf"
-            printf '%s\n' "\$harmonized_vcf" >> merge_list.txt
-            n_renamed=\$((n_renamed + 1))
-        else
-            printf '%s\n' "\$vcf" >> merge_list.txt
-        fi
-    done < file_list.txt
-    echo "Contig harmonization: renamed \$n_renamed VCFs to '\$target_style' style" >&2
-
-    if [ "\$n_files" -eq 1 ]; then
-        bcftools view -T ${study_sites} \$(cat merge_list.txt) -Oz -o merged.vcf.gz
-    else
-        # Merge only study target sites to avoid off-target REF conflicts across cohorts
-        bcftools merge --threads ${task.cpus} -R ${study_sites} -l merge_list.txt -Oz -o merged_raw.vcf.gz
-        bcftools index -t merged_raw.vcf.gz
-
-        bcftools view --threads ${task.cpus} -T ${study_sites} merged_raw.vcf.gz -Oz -o merged.vcf.gz
-        rm -f merged_raw.vcf.gz merged_raw.vcf.gz.tbi
+    n_files=\$(wc -l < file_list.txt)
+    if [ "\$n_files" -eq 0 ]; then
+        echo "ERROR: No non-redundant VCF files available after sample deduplication." >&2
+        exit 1
     fi
 
-    # Cleanup temporary harmonized VCFs
-    grep -F '.harmonized.vcf.gz' merge_list.txt | while IFS= read -r f; do
-        rm -f "\$f" "\$f.tbi"
-    done
+    if [ "\$n_files" -eq 1 ]; then
+        bcftools view -T ${chr_sites} \$(cat file_list.txt) -Oz -o "merged_${chr}.vcf.gz"
+        bcftools index -t "merged_${chr}.vcf.gz"
+    else
+        bcftools merge --threads ${task.cpus} -R ${chr_sites} -l file_list.txt -Oz -o "merged_${chr}.vcf.gz"
+        bcftools index -t "merged_${chr}.vcf.gz"
+    fi
+    """
+}
 
+process CONCAT_VCFS {
+    publishDir "${params.outdir}/merged", mode: 'copy'
+
+    input:
+    path all_merged_chrs
+    path chr_list
+    path study_sites
+
+    output:
+    tuple path("merged.vcf.gz"), path("merged.vcf.gz.tbi")
+
+    script:
+    """
+    set -euo pipefail
+
+    # Reconstruct concat list in correct chromosome order
+    > concat_list.txt
+    while IFS= read -r chr; do
+        if [ -f "merged_\${chr}.vcf.gz" ]; then
+            echo "merged_\${chr}.vcf.gz" >> concat_list.txt
+        else
+            echo "ERROR: File merged_\${chr}.vcf.gz not found" >&2
+            exit 1
+        fi
+    done < ${chr_list}
+
+    # Concatenate and index
+    bcftools concat --threads ${task.cpus} -f concat_list.txt -Oz -o merged_raw.vcf.gz
+    bcftools index -t merged_raw.vcf.gz
+
+    # Filter/View to ensure correct final sites
+    bcftools view --threads ${task.cpus} -T ${study_sites} merged_raw.vcf.gz -Oz -o merged.vcf.gz
     bcftools index -t merged.vcf.gz
-
-    n_sites=\$(bcftools query -f '%CHROM\\n' merged.vcf.gz | wc -l)
-    echo "Merged VCF: \$n_sites sites" >&2
+    rm -f merged_raw.vcf.gz merged_raw.vcf.gz.tbi
     """
 }
 
