@@ -1,6 +1,9 @@
 # admix_whole
 
-Pipeline Nextflow (DSL2) para inferencia de ancestría con ADMIXTURE supervisado a partir de VCFs completos.
+> [!IMPORTANT]
+> **WES Pipeline:** This pipeline is specifically designed and configured for Whole Exome Sequencing (WES) study samples.
+
+Pipeline Nextflow (DSL2) para inferencia de ancestría con ADMIXTURE supervisado a partir de VCFs completos de estudio (WES) y paneles de referencia (WGS).
 
 ## Qué hace
 
@@ -81,3 +84,5 @@ Se publican en `${outdir}`:
 - El pipeline asume VCFs bgzip + index (`.tbi`), y si falta índice lo crea.
 - Hay deduplicación de muestras antes del merge; si hay VCFs con traslape parcial de muestras, falla de forma explícita.
 - En los modos de referencia por glob, el `sample_id` de referencia se infiere del nombre del archivo VCF.
+- **Advertencia de Filtrado PLINK para WES (Mezcla WES/WGS):** Al mezclar muestras de estudio WES con paneles de referencia WGS (como HapMap3), las muestras WES tienen ~94% de datos faltantes en variantes fuera del exoma. Debido a que PLINK por defecto evalúa `--mind` (missingness por muestra) antes de `--geno` (missingness por variante), esto causaría la eliminación errónea de casi todas las muestras WES. Para evitar esto, el pipeline filtra primero las variantes por `--geno` (removiendo variantes fuera del exoma) antes de evaluar `--mind`.
+

@@ -226,7 +226,7 @@ workflow {
     COLLECT_STUDY_SITES(study_vcf_list_for_sites)
 
     // 5. Merge all VCFs (restricted to study sites = intersection)
-    HARMONIZE_CONTIGS(INDEX_VCF.out, COLLECT_STUDY_SITES.out)
+    HARMONIZE_CONTIGS(INDEX_VCF.out, COLLECT_STUDY_SITES.out.first())
 
     HARMONIZE_CONTIGS.out.harmonized
         .flatMap { id, vcf, tbi -> [vcf, tbi] }
@@ -412,19 +412,11 @@ process DETECT_AND_LIFTOVER {
     n_variants=\$(bcftools view -H "\$INPUT_VCF" | wc -l)
     echo "Variants after all-sites filtering: \$n_variants" >> "\$REPORT"
 
-    # ── 4. Liftover if GRCh37 ────────────────────────────────────────────
-    if [ "\$IS_GRCH37" -eq 1 ]; then
-
-        echo ">>> PERFORMING LIFTOVER GRCh37 -> GRCh38 <<<" >> "\$REPORT"
-        echo "    Chain file : ${chain}" >> "\$REPORT"
-        echo "    Target ref : ${grch38_ref}" >> "\$REPORT"
-
-        # The UCSC chain uses chr-prefixed names (chr1, chr2, ...).
-        # If the input VCF uses bare names (1, 2, ...), add chr prefix first.
-        first_chr=\$(bcftools query -f '%CHROM\\n' "\$INPUT_VCF" | head -1 || true)
-        if [[ ! "\$first_chr" == chr* ]]; then
-            echo "    Renaming contigs: adding 'chr' prefix to match chain file" >> "\$REPORT"
-            cat > add_chr_map.tsv <<'CHRMAP'
+    # ── 4. Ensure contigs have 'chr' prefix ──────────────────────────────
+    first_chr=\$(bcftools query -f '%CHROM\\n' "\$INPUT_VCF" | head -1 || true)
+    if [[ ! "\$first_chr" == chr* ]] && [[ -n "\$first_chr" ]]; then
+        echo "    Renaming contigs: adding 'chr' prefix" >> "\$REPORT"
+        cat > add_chr_map.tsv <<'CHRMAP'
 1	chr1
 2	chr2
 3	chr3
@@ -452,10 +444,17 @@ Y	chrY
 MT	chrM
 M	chrM
 CHRMAP
-            bcftools annotate --rename-chrs add_chr_map.tsv "\$INPUT_VCF" -Oz -o renamed.vcf.gz
-            bcftools index -t renamed.vcf.gz
-            INPUT_VCF=renamed.vcf.gz
-        fi
+        bcftools annotate --rename-chrs add_chr_map.tsv "\$INPUT_VCF" -Oz -o renamed.vcf.gz
+        bcftools index -t renamed.vcf.gz
+        INPUT_VCF=renamed.vcf.gz
+    fi
+
+    # ── 5. Liftover if GRCh37 ────────────────────────────────────────────
+    if [ "\$IS_GRCH37" -eq 1 ]; then
+
+        echo ">>> PERFORMING LIFTOVER GRCh37 -> GRCh38 <<<" >> "\$REPORT"
+        echo "    Chain file : ${chain}" >> "\$REPORT"
+        echo "    Target ref : ${grch38_ref}" >> "\$REPORT"
 
         # Run Picard LiftoverVcf
         # Use a recent Picard jar to avoid htsjdk genotype-validation crashes seen in older releases.
@@ -548,14 +547,12 @@ process HARMONIZE_CONTIGS {
     """
     set -euo pipefail
 
-    first_site_chr=\$(awk 'NR==1 {print \$1}' ${study_sites})
-    if [ -z "\$first_site_chr" ]; then
+    if [ ! -s "${study_sites}" ]; then
         echo "ERROR: Study site list is empty." >&2
         exit 1
     fi
 
-    target_style="nochr"
-    if [[ "\$first_site_chr" == chr* ]]; then
+    if grep -q '^chr' "${study_sites}"; then
         target_style="chr"
         cat > chr_map.tsv <<'EOF'
 1	chr1
@@ -867,13 +864,18 @@ process PREPARE_PLINK {
     mv snps_filtered.fam snps.fam
 
     # QC (strict first): MAF, missingness, mind
+    # Note: To avoid discarding WES study samples due to missingness in non-exonic WGS reference variants,
+    # we filter variants by --geno first before applying the --mind filter.
     strict_ok=1
     if ! \$plink --threads ${task.cpus} --memory \$mem_mb \\
-        --bfile snps --maf ${params.maf} --geno ${params.geno} --mind ${params.mind} --make-bed --out clean_strict
+        --bfile snps --geno ${params.geno} --make-bed --out snps_geno_filtered || \\
+       ! \$plink --threads ${task.cpus} --memory \$mem_mb \\
+        --bfile snps_geno_filtered --maf ${params.maf} --mind ${params.mind} --make-bed --out clean_strict
     then
         strict_ok=0
         echo "Strict QC failed; switching to relaxed QC." >&2
     fi
+
 
     # Ensure strict QC retains reference samples from all expected populations.
     # If not, rerun with relaxed missingness filter to preserve supervision anchors.

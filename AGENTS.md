@@ -2,6 +2,9 @@
 
 Operational guide for agents working on `admix_whole`.
 
+> [!IMPORTANT]
+> **WES Pipeline:** This pipeline is specifically configured for Whole Exome Sequencing (WES) study samples.
+
 ## Goal
 
 Run supervised ADMIXTURE ancestry inference for the leukemia exome cohort using the 50 final VCF symlinks produced upstream.
@@ -110,6 +113,12 @@ Use these unless the user explicitly changes the analysis:
 --max_cpus 18
 --max_memory "120 GB"
 ```
+
+### WES Caveat on PLINK Filter Ordering
+Because the study cohort is WES while reference panels are WGS, study samples have high missingness (~94%) on non-exonic variants. If `--mind` and `--geno` are run in a single PLINK command, PLINK applies `--mind` first and incorrectly discards the WES samples. 
+To prevent this, the pipeline splits PLINK filtering:
+1. Filter variants first by `--geno ${params.geno}` to restrict to exome-covering variants.
+2. Filter samples/variants next by `--maf` and `--mind` on the exome-restricted variants.
 
 Primary run also includes:
 
